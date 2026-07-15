@@ -229,6 +229,34 @@ tr:last-child td { border-bottom: none; }
 .rate-btn.on { background: var(--teal-soft); color: var(--teal); border-color: var(--teal); }
 .rate-btn.sel { background: var(--teal); color: #fff; border-color: var(--teal); transform: scale(1.08); }
 
+/* ---------- Satisfaction slider ---------- */
+.sat-slider { padding: 4px 2px; }
+.sat-slider input[type="range"] {
+  width: 100%; -webkit-appearance: none; appearance: none; height: 10px;
+  border-radius: 999px; outline: none; margin: 8px 0 4px;
+  background: linear-gradient(90deg, var(--danger), var(--amber), var(--teal));
+}
+.sat-slider input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none; width: 26px; height: 26px; border-radius: 50%;
+  background: #fff; border: 3px solid var(--teal); cursor: pointer; box-shadow: var(--shadow);
+}
+.sat-slider input[type="range"]::-moz-range-thumb {
+  width: 26px; height: 26px; border-radius: 50%; background: #fff; border: 3px solid var(--teal); cursor: pointer;
+}
+.sat-scale { display: flex; justify-content: space-between; font-size: 0.72rem; color: var(--muted); }
+.sat-val { text-align: center; font-size: 1.5rem; font-weight: 700; color: var(--teal); margin-top: 4px; }
+
+/* ---------- Chips (preset factors) ---------- */
+.chip-row { display: flex; flex-wrap: wrap; gap: 8px; }
+.chip {
+  border: 1px solid var(--line); background: #fff; color: var(--muted);
+  padding: 7px 14px; border-radius: 999px; font-family: inherit; font-size: 0.85rem;
+  font-weight: 600; cursor: pointer; transition: .12s;
+}
+.chip-good.on { background: var(--teal-soft); color: var(--teal); border-color: var(--teal); }
+.chip-bad.on { background: #fde0e3; color: var(--danger); border-color: var(--danger); }
+.chip:hover { border-color: var(--pink); }
+
 @media (max-width: 560px) {
   .topbar .brand span.full { display: none; }
   .container { padding: 12px; }
