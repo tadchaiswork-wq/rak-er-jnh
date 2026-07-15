@@ -260,10 +260,24 @@ auth.onAuthStateChanged(async (user) => {
     if (profile.disabled) { await auth.signOut(); toast("บัญชีนี้ถูกระงับการใช้งาน", "err"); return; }
     State.user = user; State.profile = profile;
     render();
+    writePresence();
   } catch (e) {
     toast("โหลดข้อมูลผิดพลาด: " + friendlyErr(e), "err");
   }
 });
+
+// บันทึกว่าผู้ใช้ล็อกอินอยู่ในเวรใด (ช่วงต่อเวรจะเป็นเวรถัดไป) เพื่อให้เห็นสมาชิกเวรถัดไปที่ล็อกอินแล้ว
+async function writePresence() {
+  if (!State.profile || State.profile.role === "station") return;
+  const cur = currentShift();
+  try {
+    await db.collection("presence").doc(`${State.user.uid}_${cur.key}`).set({
+      uid: State.user.uid, fullName: State.profile.fullName, role: State.profile.role,
+      shiftKey: cur.key, date: cur.date, shift: cur.shift,
+      ts: firebase.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+  } catch (e) {}
+}
 
 async function logout() { await auth.signOut(); toast("ออกจากระบบแล้ว"); }
 
@@ -275,6 +289,7 @@ function tabsForRole(role) {
     { id: "home", label: "หน้าหลัก" },
     { id: "report", label: "รายงาน" },
     { id: "praise", label: "ชื่นชม" },
+    { id: "satisfaction", label: "พึงพอใจเวร" },
   ];
   if (role === "member") return base;
   // admin & superadmin
@@ -325,6 +340,7 @@ function renderView() {
     case "checkin": return viewCheckin(v);
     case "report": return viewReport(v);
     case "praise": return viewPraise(v);
+    case "satisfaction": return viewSatisfaction(v);
     case "dashboard": return viewDashboard(v);
     case "users": return viewUsers(v);
     case "reports": return viewPersonReports(v);
@@ -363,19 +379,37 @@ async function viewHome(v) {
       <div id="coworkers" class="person-list"><div class="empty">กำลังโหลด…</div></div>
     </div>`;
   drawMyBarcode();
-  const coworkers = await getCoworkers(cur.key);
+  const members = await getShiftMembers(cur.key);
   const box = el("coworkers");
-  if (!coworkers.length) { box.innerHTML = `<div class="empty">ยังไม่มีใครสแกนเข้าเวรนี้<br/>สแกนบาร์โค้ดของคุณที่เครื่องสแกนหน้างาน ER เพื่อลงเวร</div>`; return; }
-  box.innerHTML = coworkers.map(personRowHTML).join("");
+  if (!members.length) { box.innerHTML = `<div class="empty">ยังไม่มีสมาชิกในเวรนี้<br/>สแกนบาร์โค้ดของคุณที่เครื่องสแกนหน้างาน ER เพื่อลงเวร</div>`; return; }
+  box.innerHTML = members.map(personRowHTML).join("");
 }
 
 function personRowHTML(c) {
+  const timeStr = c.checkedIn && c.ts ? new Date(c.ts.toDate ? c.ts.toDate() : c.ts).toLocaleTimeString("th-TH", { hour: "2-digit", minute: "2-digit" }) : "";
+  const status = c.uid === State.user.uid
+    ? '<span class="badge badge-shift">คุณ</span>'
+    : c.checkedIn
+      ? (c.late ? `<span class="badge badge-flag">สาย ${c.lateMinutes} น.</span>` : '<span class="badge badge-shift">เข้าเวรแล้ว</span>')
+      : '<span class="badge badge-warn">ล็อกอินรอ</span>';
   return `<div class="person-row">
-    <div class="avatar">${initials(c.fullName)}</div>
+    <div class="avatar" style="${c.checkedIn ? "" : "background:var(--muted)"}">${initials(c.fullName)}</div>
     <div class="meta"><div class="n">${esc(c.fullName)}</div>
-      <div class="s">เข้าเวร ${c.ts ? new Date(c.ts.toDate ? c.ts.toDate() : c.ts).toLocaleTimeString("th-TH", { hour: "2-digit", minute: "2-digit" }) : ""}</div></div>
-    ${c.uid === State.user.uid ? '<span class="badge badge-shift">คุณ</span>' : ""}
+      <div class="s">${c.checkedIn ? "เข้าเวร " + timeStr : "ล็อกอินแล้ว • ยังไม่สแกนเข้าเวร"}</div></div>
+    ${status}
   </div>`;
+}
+
+// รวมสมาชิกเวร: คนที่สแกนเข้าเวรแล้ว (checkins) + คนที่ล็อกอินไว้สำหรับเวรนี้ (presence)
+async function getShiftMembers(shiftKey) {
+  const [chk, pres] = await Promise.all([
+    db.collection("checkins").where("shiftKey", "==", shiftKey).get(),
+    db.collection("presence").where("shiftKey", "==", shiftKey).get(),
+  ]);
+  const map = {};
+  pres.docs.forEach((d) => { const x = d.data(); map[x.uid] = { uid: x.uid, fullName: x.fullName, checkedIn: false, ts: null, loginTs: x.ts }; });
+  chk.docs.forEach((d) => { const x = d.data(); map[x.uid] = { ...(map[x.uid] || {}), uid: x.uid, fullName: x.fullName, checkedIn: true, ts: x.ts, late: x.late, lateMinutes: x.lateMinutes }; });
+  return Object.values(map).sort((a, b) => (a.checkedIn === b.checkedIn ? 0 : a.checkedIn ? -1 : 1));
 }
 
 async function getCoworkers(shiftKey) {
@@ -640,6 +674,63 @@ async function getMyRecords(coll, shiftKey) {
 }
 
 /* ============================================================
+   SATISFACTION — ความพึงพอใจในการอยู่เวร (1–10)
+   ============================================================ */
+async function viewSatisfaction(v) {
+  const shifts = getSelectableShifts();
+  if (!shifts.length) { v.innerHTML = emptyShiftCard("ความพึงพอใจในการอยู่เวร"); return; }
+  v.innerHTML = `
+    <div class="card">
+      <div class="section-title">😊 ความพึงพอใจในการอยู่เวร</div>
+      <div class="sub">ให้คะแนน 1–10 (10 = พึงพอใจมากที่สุด) • ใส่ข้อเสนอแนะได้ • แก้ไขได้ภายใน 3 ชม.หลังลงเวร</div>
+      <div class="field"><label>เลือกเวร</label>
+        <select id="st-shift">${shifts.map((s) => `<option value="${s.key}">${SHIFT_SHORT[s.shift]} • ${s.date}${s.isCurrent ? " (เวรปัจจุบัน)" : " (ย้อนหลัง)"}</option>`).join("")}</select></div>
+      <div id="st-body"><div class="empty">กำลังโหลด…</div></div>
+    </div>`;
+  const load = () => loadSatisfaction(el("st-shift").value);
+  el("st-shift").onchange = load;
+  load();
+}
+
+async function loadSatisfaction(shiftKey) {
+  const body = el("st-body");
+  body.innerHTML = `<div class="empty">กำลังโหลด…</div>`;
+  const docRef = db.collection("satisfaction").doc(`${State.user.uid}_${shiftKey}`);
+  const snap = await docRef.get();
+  const existing = snap.exists ? snap.data() : null;
+  let selected = existing ? existing.rating : 0;
+  body.innerHTML = `
+    <div class="field"><label>คะแนนความพึงพอใจ (1 = น้อยที่สุด, 10 = มากที่สุด)</label>
+      <div id="rate-row" class="rate-row"></div>
+      <div id="rate-label" class="sub" style="margin-top:6px"></div></div>
+    <div class="field"><label>ข้อเสนอแนะ (ไม่บังคับ)</label>
+      <textarea id="st-sug" placeholder="สิ่งที่อยากเสนอแนะ/ปรับปรุงในเวรนี้">${esc(existing ? existing.suggestion : "")}</textarea></div>
+    <button class="btn btn-primary btn-block" id="st-save">${existing ? "อัปเดต" : "บันทึก"}ความพึงพอใจ</button>`;
+  const row = el("rate-row"), lbl = el("rate-label");
+  const draw = () => {
+    row.innerHTML = Array.from({ length: 10 }, (_, i) => i + 1)
+      .map((n) => `<button class="rate-btn ${n <= selected ? "on" : ""} ${n === selected ? "sel" : ""}" data-n="${n}">${n}</button>`).join("");
+    lbl.textContent = selected ? `เลือก ${selected}/10` : "ยังไม่ได้ให้คะแนน";
+    row.querySelectorAll("button").forEach((b) => b.onclick = () => { selected = +b.dataset.n; draw(); });
+  };
+  draw();
+  el("st-save").onclick = async () => {
+    if (!selected) return toast("กรุณาเลือกคะแนน 1–10", "err");
+    try {
+      await docRef.set({
+        uid: State.user.uid, fullName: State.profile.fullName,
+        shiftKey, ym: shiftKey.slice(0, 7), date: shiftKey.slice(0, 10), shift: shiftKey.split("_")[1],
+        rating: selected, suggestion: el("st-sug").value.trim(),
+        createdAt: existing ? existing.createdAt : firebase.firestore.FieldValue.serverTimestamp(),
+        updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
+      toast("บันทึกความพึงพอใจแล้ว 😊", "ok");
+      loadSatisfaction(shiftKey);
+    } catch (e) { toast("บันทึกไม่สำเร็จ: " + friendlyErr(e), "err"); }
+  };
+}
+
+/* ============================================================
    DASHBOARD — monthly ranking
    ============================================================ */
 async function viewDashboard(v) {
@@ -662,14 +753,16 @@ async function viewDashboard(v) {
 async function loadDashboard(month, showEval) {
   const body = el("db-body");
   body.innerHTML = `<div class="empty">กำลังโหลด…</div>`;
-  const [repSnap, appSnap, chkSnap] = await Promise.all([
+  const [repSnap, appSnap, chkSnap, satSnap] = await Promise.all([
     db.collection("reports").where("ym", "==", month).get(),
     db.collection("appreciations").where("ym", "==", month).get(),
     db.collection("checkins").where("ym", "==", month).get(),
+    db.collection("satisfaction").where("ym", "==", month).get(),
   ]);
   const reports = repSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
   const apps = appSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
   const checkins = chkSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
+  const sats = satSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
   const agg = {};
   const ensure = (uid, name) => (agg[uid] = agg[uid] || { uid, name, reports: 0, praises: 0, active: 0 });
   reports.forEach((r) => { const a = ensure(r.toUid, r.toName); a.reports++; if (!r.cleared) a.active++; });
@@ -687,11 +780,16 @@ async function loadDashboard(month, showEval) {
     .sort((a, b) => b.lateCount - a.lateCount || b.totalMin - a.totalMin);
   const totalLate = checkins.filter((c) => c.late).length;
 
+  // ---- ความพึงพอใจ ----
+  const satAvg = sats.length ? (sats.reduce((s, r) => s + (r.rating || 0), 0) / sats.length) : 0;
+  const satWithSug = sats.filter((r) => (r.suggestion || "").trim()).sort((a, b) => (b.updatedAt && a.updatedAt ? (b.updatedAt.seconds || 0) - (a.updatedAt.seconds || 0) : 0));
+
   el("db-stats").innerHTML = `
     <div class="stat"><div class="num">${reports.length}</div><div class="lbl">รายงานทั้งหมด</div></div>
     <div class="stat"><div class="num">${apps.length}</div><div class="lbl">คำชื่นชม</div></div>
     <div class="stat"><div class="num">${rows.filter((r) => r.active >= FLAG_THRESHOLD).length}</div><div class="lbl">ต้องพบแอดมิน</div></div>
-    <div class="stat"><div class="num" style="color:var(--amber)">${totalLate}</div><div class="lbl">มาสาย (ครั้ง)</div></div>`;
+    <div class="stat"><div class="num" style="color:var(--amber)">${totalLate}</div><div class="lbl">มาสาย (ครั้ง)</div></div>
+    <div class="stat"><div class="num" style="color:var(--teal)">${sats.length ? satAvg.toFixed(1) : "-"}</div><div class="lbl">พึงพอใจเฉลี่ย /10</div></div>`;
 
   const rankTable = !rows.length ? `<div class="empty">ยังไม่มีข้อมูลการประเมินในเดือนนี้</div>` : `
     <div class="table-wrap"><table>
@@ -727,7 +825,18 @@ async function loadDashboard(month, showEval) {
       <button class="btn btn-amber" id="late-pdf">📄 ออกรายงานคนมาสาย PDF</button>
     </div>`}`;
 
-  body.innerHTML = rankTable + lateTable;
+  const satTable = `
+    <div class="section-title" style="margin-top:22px">😊 ความพึงพอใจในการอยู่เวร ${sats.length ? `(เฉลี่ย ${satAvg.toFixed(1)}/10 จาก ${sats.length} ครั้ง)` : ""}</div>
+    ${!sats.length ? '<div class="empty">เดือนนี้ยังไม่มีการให้คะแนนความพึงพอใจ</div>' : `
+    <div class="sub" style="margin-bottom:8px">ข้อเสนอแนะ (${satWithSug.length})</div>
+    ${satWithSug.length ? satWithSug.map((r) => `<div class="person-row" style="margin-bottom:8px"><div class="meta">
+        <div class="n">${esc(r.fullName)} — ${r.rating}/10 <span class="s">(${esc(r.date)} เวร${SHIFT_SHORT[r.shift] || r.shift})</span></div>
+        <div class="s">💬 ${esc(r.suggestion)}</div></div></div>`).join("") : '<div class="empty">ไม่มีข้อเสนอแนะ</div>'}
+    <div class="btn-row no-print" style="margin-top:14px">
+      <button class="btn btn-teal" id="sat-pdf">📄 ออกรายงานความพึงพอใจ PDF</button>
+    </div>`}`;
+
+  body.innerHTML = rankTable + lateTable + satTable;
 
   body.querySelectorAll("button[data-uid]").forEach((b) => {
     b.onclick = () => showDetailModal(b.dataset.uid, b.dataset.name, month, reports, apps, showEval);
@@ -739,6 +848,8 @@ async function loadDashboard(month, showEval) {
   if (pdfBtn) pdfBtn.onclick = () => printDashboard(month, rows, showEval);
   const latePdf = el("late-pdf");
   if (latePdf) latePdf.onclick = () => printLateReport(month, lateRows);
+  const satPdf = el("sat-pdf");
+  if (satPdf) satPdf.onclick = () => printSatisfactionReport(month, sats, satAvg);
 }
 
 function showLateDetailModal(name, month, agg) {
@@ -1061,4 +1172,14 @@ function printLateReport(month, lateRows) {
     <tbody>${lateRows.map((r, i) => `<tr><td>${i + 1}</td><td>${esc(r.name)}</td><td>${r.lateCount}</td><td>${r.totalMin}</td><td>${r.shifts || "-"}</td></tr>`).join("")}</tbody></table>
     <h3>รายละเอียดรายคน</h3>${detail}`;
   openPrintWindow("รายงานคนมาสาย " + month, body);
+}
+
+function printSatisfactionReport(month, sats, avg) {
+  const withSug = sats.filter((r) => (r.suggestion || "").trim());
+  const rows = sats.slice().sort((a, b) => (a.date || "").localeCompare(b.date || ""));
+  const body = `<div class="muted">รายงานความพึงพอใจในการอยู่เวร • เดือน ${esc(month)}</div>
+    <p>จำนวน ${sats.length} ครั้ง • คะแนนเฉลี่ย ${sats.length ? avg.toFixed(2) : "-"}/10 • มีข้อเสนอแนะ ${withSug.length} รายการ</p>
+    <table><thead><tr><th>วันที่</th><th>เวร</th><th>ชื่อ</th><th>คะแนน</th><th>ข้อเสนอแนะ</th></tr></thead>
+    <tbody>${rows.map((r) => `<tr><td>${esc(r.date)}</td><td>${SHIFT_SHORT[r.shift] || esc(r.shift || "")}</td><td>${esc(r.fullName)}</td><td>${r.rating}/10</td><td>${esc(r.suggestion || "")}</td></tr>`).join("")}</tbody></table>`;
+  openPrintWindow("รายงานความพึงพอใจ " + month, body);
 }
