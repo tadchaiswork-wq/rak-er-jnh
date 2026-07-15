@@ -51,7 +51,28 @@
     clearTimeout(toast._t); toast._t=setTimeout(()=>t.className="toast",3000); }
 
   function classifyShift(d){ const h=d.getHours(); if(h>=8&&h<16)return"morning"; if(h>=16)return"afternoon"; return"night"; }
-  function currentShift(now=new Date()){ return { key:`${ymd(now)}_${classifyShift(now)}`, date:ymd(now), shift:classifyShift(now) }; }
+  const EARLY_MS=20*60*1000, LATE_MIN=10;
+  function shiftEvents(now){
+    const evs=[];
+    for(const off of [-1,0,1]){
+      const b=new Date(now); b.setDate(b.getDate()+off);
+      const y=b.getFullYear(),m=b.getMonth(),d=b.getDate();
+      evs.push({shift:"night",start:new Date(y,m,d,0,0)});
+      evs.push({shift:"morning",start:new Date(y,m,d,8,0)});
+      evs.push({shift:"afternoon",start:new Date(y,m,d,16,0)});
+    }
+    evs.forEach(e=>{ e.end=new Date(e.start.getTime()+8*3600*1000); e.date=ymd(e.start); e.key=`${e.date}_${e.shift}`; });
+    return evs.sort((a,b)=>a.start-b.start);
+  }
+  function assignShift(now=new Date()){
+    const evs=shiftEvents(now);
+    for(const e of evs){ if(now<e.start && e.start-now<=EARLY_MS) return {...e,lateMinutes:0,late:false,early:true}; }
+    for(const e of evs){ if(now>=e.start && now<e.end){ const lm=Math.floor((now-e.start)/60000); return {...e,lateMinutes:lm,late:lm>LATE_MIN,early:false}; } }
+    const e=[...evs].reverse().find(x=>now>=x.start)||evs[0];
+    const lm=Math.max(0,Math.floor((now-e.start)/60000));
+    return {...e,lateMinutes:lm,late:lm>LATE_MIN,early:false};
+  }
+  function currentShift(now=new Date()){ const a=assignShift(now); return { key:a.key, date:a.date, shift:a.shift }; }
 
   let profile=null, scanner=null;
   const lastScan={}; // barcode -> timestamp (cooldown)
@@ -140,18 +161,23 @@
       if(snap.empty){ showResult("err","ไม่พบบาร์โค้ดนี้","รหัส: "+code); beep(false); return; }
       const m={id:snap.docs[0].id,...snap.docs[0].data()};
       if(m.disabled){ showResult("err","บัญชีถูกระงับ",esc(m.fullName)); return; }
-      const cur=currentShift();
-      const docId=`${m.id}_${cur.key}`;
+      const a=assignShift(new Date());
+      const docId=`${m.id}_${a.key}`;
       const exist=await db.collection("checkins").doc(docId).get();
-      if(exist.exists){ showResult("dup","เข้าเวรนี้อยู่แล้ว",esc(m.fullName)+" • เวร"+SHIFT_SHORT[cur.shift]); return; }
+      if(exist.exists){ showResult("dup","เข้าเวรนี้อยู่แล้ว",esc(m.fullName)+" • เวร"+SHIFT_SHORT[a.shift]); return; }
       await db.collection("checkins").doc(docId).set({
         uid:m.id, fullName:m.fullName, barcodeId:m.barcodeId,
-        shiftKey:cur.key, date:cur.date, shift:cur.shift,
+        shiftKey:a.key, date:a.date, shift:a.shift, ym:a.date.slice(0,7),
+        shiftStart:a.start.toISOString(), lateMinutes:a.lateMinutes, late:a.late, early:a.early,
         scannedBy:profile.fullName,
         ts:firebase.firestore.FieldValue.serverTimestamp(),
       });
-      showResult("ok","เข้าเวร"+SHIFT_SHORT[cur.shift]+"สำเร็จ ✓", esc(m.fullName));
-      beep(true);
+      if(a.late){
+        showResult("dup","เข้าเวร"+SHIFT_SHORT[a.shift]+" — มาสาย "+a.lateMinutes+" นาที", esc(m.fullName));
+      } else {
+        showResult("ok","เข้าเวร"+SHIFT_SHORT[a.shift]+"สำเร็จ ✓"+(a.early?" (มาก่อนเวลา)":""), esc(m.fullName));
+      }
+      beep(!a.late);
       loadRecent();
     }catch(e){ showResult("err","บันทึกไม่สำเร็จ",(e&&e.message)||""); }
   }
@@ -176,8 +202,8 @@
       box.innerHTML=list.map(c=>`<div class="person-row">
         <div class="avatar" style="background:var(--teal)">${(c.fullName||"?").charAt(0)}</div>
         <div class="meta"><div class="n">${esc(c.fullName)}</div>
-          <div class="s">${c.ts&&c.ts.toDate?c.ts.toDate().toLocaleTimeString("th-TH",{hour:"2-digit",minute:"2-digit"}):""}</div></div>
-        <span class="badge badge-shift">✓</span></div>`).join("");
+          <div class="s">${c.ts&&c.ts.toDate?c.ts.toDate().toLocaleTimeString("th-TH",{hour:"2-digit",minute:"2-digit"}):""}${c.early?" • มาก่อนเวลา":""}</div></div>
+        ${c.late?`<span class="badge badge-flag">สาย ${c.lateMinutes} น.</span>`:'<span class="badge badge-shift">✓ ตรงเวลา</span>'}</div>`).join("");
     }catch(e){}
   }
 
