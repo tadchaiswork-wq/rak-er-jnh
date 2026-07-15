@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>เครื่องสแกนเข้าเวร — ER JNH</title>
+  <link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="css/styles.css" />
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+  <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+  <style>
+    .kiosk-top { background: linear-gradient(135deg,var(--teal),#0b7c72); color:#fff; padding:16px 22px;
+      display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px; }
+    .kiosk-top .t { font-weight:700; font-size:1.2rem; }
+    .kiosk-top .clock { font-size:1.6rem; font-weight:700; font-variant-numeric:tabular-nums; }
+    .kiosk-top .shift { background:rgba(255,255,255,.2); padding:4px 14px; border-radius:999px; font-weight:600; }
+    .kiosk-wrap { max-width:640px; margin:0 auto; padding:18px; }
+    #kiosk-scanner { border-radius:16px; overflow:hidden; box-shadow:var(--shadow); }
+    .result-banner { border-radius:16px; padding:22px; text-align:center; margin:16px 0; min-height:96px;
+      display:flex; flex-direction:column; justify-content:center; transition:.15s; }
+    .result-banner.idle { background:var(--card); color:var(--muted); }
+    .result-banner.ok { background:var(--teal-soft); color:var(--teal); }
+    .result-banner.dup { background:var(--amber-soft); color:var(--amber); }
+    .result-banner.err { background:#fde0e3; color:var(--danger); }
+    .result-banner .big { font-size:1.5rem; font-weight:700; }
+    .result-banner .small { font-size:1rem; margin-top:4px; }
+    .recent { background:var(--card); border-radius:16px; padding:16px; box-shadow:var(--shadow); }
+    .recent h3 { font-size:1rem; margin-bottom:10px; }
+    .kiosk-login { min-height:100vh; display:flex; align-items:center; justify-content:center; padding:20px; }
+  </style>
+</head>
+<body>
+  <div id="kioskApp"><div class="loading-screen"><div class="spinner"></div><p>กำลังโหลด…</p></div></div>
+  <div id="toast" class="toast"></div>
+
+  <script src="js/firebase-config.js"></script>
+  <script>
+  firebase.initializeApp(firebaseConfig);
+  const auth = firebase.auth();
+  const db = firebase.firestore();
+  const app = document.getElementById("kioskApp");
+  const el = (id) => document.getElementById(id);
+  const pad = (n) => String(n).padStart(2, "0");
+  const ymd = (d) => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
+  const esc = (s) => String(s==null?"":s).replace(/[&<>"']/g,(c)=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+  const SHIFT_SHORT = { morning:"เช้า", afternoon:"บ่าย", night:"ดึก" };
+
+  function toast(msg,type=""){ const t=el("toast"); t.textContent=msg; t.className="toast show "+type;
+    clearTimeout(toast._t); toast._t=setTimeout(()=>t.className="toast",3000); }
+
+  function classifyShift(d){ const h=d.getHours(); if(h>=8&&h<16)return"morning"; if(h>=16)return"afternoon"; return"night"; }
+  function currentShift(now=new Date()){ return { key:`${ymd(now)}_${classifyShift(now)}`, date:ymd(now), shift:classifyShift(now) }; }
+
+  let profile=null, scanner=null;
+  const lastScan={}; // barcode -> timestamp (cooldown)
+  const COOLDOWN=8000;
+
+  /* ---------- auth ---------- */
+  auth.onAuthStateChanged(async (user)=>{
+    if(!user){ renderLogin(); return; }
+    try{
+      const snap=await db.collection("users").doc(user.uid).get();
+      if(!snap.exists){ await auth.signOut(); return; }
+      const p={id:user.uid,...snap.data()};
+      if(p.disabled){ await auth.signOut(); toast("บัญชีถูกระงับ","err"); return; }
+      if(!["station","admin","superadmin"].includes(p.role)){
+        await auth.signOut(); toast("บัญชีนี้ไม่มีสิทธิ์เปิดเครื่องสแกน","err"); return;
+      }
+      profile=p; renderKiosk();
+    }catch(e){ toast("โหลดข้อมูลผิดพลาด","err"); }
+  });
+
+  function renderLogin(){
+    app.innerHTML=`<div class="kiosk-login"><div class="auth-card card">
+      <div class="auth-logo"><div class="heart">📷</div>
+        <h1>เครื่องสแกนเข้าเวร</h1><p>ER JNH — เข้าสู่ระบบด้วยบัญชีเครื่องสแกน</p></div>
+      <div class="field"><label>รหัสผู้ใช้ (username)</label><input id="k-user" placeholder="บัญชี station หรือ แอดมิน"/></div>
+      <div class="field"><label>รหัสผ่าน</label><input id="k-pass" type="password"/></div>
+      <button class="btn btn-teal btn-block" id="k-btn">เข้าสู่ระบบ</button>
+      <div class="auth-switch"><a href="index.html">← กลับหน้าแอปหลัก</a></div>
+    </div></div>`;
+    el("k-btn").onclick=doLogin;
+    el("k-pass").addEventListener("keydown",(e)=>e.key==="Enter"&&doLogin());
+  }
+  async function doLogin(){
+    const u=el("k-user").value.trim().toLowerCase(), p=el("k-pass").value;
+    if(!u||!p) return toast("กรอกข้อมูลให้ครบ","err");
+    el("k-btn").disabled=true;
+    try{ await auth.signInWithEmailAndPassword(u+"@"+EMAIL_DOMAIN,p); }
+    catch(e){ el("k-btn").disabled=false; toast("เข้าสู่ระบบไม่สำเร็จ","err"); }
+  }
+
+  /* ---------- kiosk ---------- */
+  function renderKiosk(){
+    const cur=currentShift();
+    app.innerHTML=`
+      <div class="kiosk-top">
+        <div class="t">📷 เครื่องสแกนเข้าเวร ER JNH</div>
+        <div class="shift">เวร${SHIFT_SHORT[cur.shift]}</div>
+        <div class="clock" id="clock">--:--:--</div>
+        <button class="btn btn-sm btn-outline" id="k-logout">ออกจากระบบ</button>
+      </div>
+      <div class="kiosk-wrap">
+        <div id="result" class="result-banner idle"><div class="big">พร้อมสแกน</div>
+          <div class="small">ให้เพื่อนร่วมงานแสดงบาร์โค้ดต่อกล้อง</div></div>
+        <div id="kiosk-scanner"></div>
+        <div class="recent" style="margin-top:16px">
+          <h3>เข้าเวรล่าสุด (เวร${SHIFT_SHORT[cur.shift]} • ${cur.date})</h3>
+          <div id="recent-list" class="person-list"><div class="empty">—</div></div>
+        </div>
+      </div>`;
+    el("k-logout").onclick=async()=>{ await stopScanner(); await auth.signOut(); };
+    tickClock(); setInterval(tickClock,1000);
+    startScanner();
+    loadRecent();
+    setInterval(loadRecent,15000);
+  }
+  function tickClock(){ const c=el("clock"); if(c) c.textContent=new Date().toLocaleTimeString("th-TH"); }
+
+  function startScanner(){
+    scanner=new Html5Qrcode("kiosk-scanner");
+    scanner.start({facingMode:"environment"},
+      { fps:10, qrbox:{width:300,height:150},
+        formatsToSupport:[Html5QrcodeSupportedFormats.CODE_128,Html5QrcodeSupportedFormats.CODE_39,
+          Html5QrcodeSupportedFormats.EAN_13,Html5QrcodeSupportedFormats.QR_CODE] },
+      onScan, ()=>{}
+    ).catch((e)=>showResult("err","เปิดกล้องไม่ได้", (e && e.message)||"อนุญาตการใช้กล้องแล้วลองใหม่"));
+  }
+  async function stopScanner(){ if(scanner){ try{ await scanner.stop(); scanner.clear(); }catch(e){} scanner=null; } }
+
+  async function onScan(decoded){
+    const code=(decoded||"").trim().toUpperCase();
+    const now=Date.now();
+    if(lastScan[code] && now-lastScan[code]<COOLDOWN) return; // กันสแกนซ้ำเร็วเกินไป
+    lastScan[code]=now;
+    try{
+      const snap=await db.collection("users").where("barcodeId","==",code).limit(1).get();
+      if(snap.empty){ showResult("err","ไม่พบบาร์โค้ดนี้","รหัส: "+code); beep(false); return; }
+      const m={id:snap.docs[0].id,...snap.docs[0].data()};
+      if(m.disabled){ showResult("err","บัญชีถูกระงับ",esc(m.fullName)); return; }
+      const cur=currentShift();
+      const docId=`${m.id}_${cur.key}`;
+      const exist=await db.collection("checkins").doc(docId).get();
+      if(exist.exists){ showResult("dup","เข้าเวรนี้อยู่แล้ว",esc(m.fullName)+" • เวร"+SHIFT_SHORT[cur.shift]); return; }
+      await db.collection("checkins").doc(docId).set({
+        uid:m.id, fullName:m.fullName, barcodeId:m.barcodeId,
+        shiftKey:cur.key, date:cur.date, shift:cur.shift,
+        scannedBy:profile.fullName,
+        ts:firebase.firestore.FieldValue.serverTimestamp(),
+      });
+      showResult("ok","เข้าเวร"+SHIFT_SHORT[cur.shift]+"สำเร็จ ✓", esc(m.fullName));
+      beep(true);
+      loadRecent();
+    }catch(e){ showResult("err","บันทึกไม่สำเร็จ",(e&&e.message)||""); }
+  }
+
+  function showResult(type,big,small){
+    const r=el("result"); if(!r) return;
+    r.className="result-banner "+type;
+    r.innerHTML=`<div class="big">${big}</div><div class="small">${small||""}</div>`;
+    clearTimeout(showResult._t);
+    showResult._t=setTimeout(()=>{ r.className="result-banner idle";
+      r.innerHTML='<div class="big">พร้อมสแกน</div><div class="small">ให้เพื่อนร่วมงานแสดงบาร์โค้ดต่อกล้อง</div>'; },4000);
+  }
+
+  async function loadRecent(){
+    const cur=currentShift();
+    try{
+      const snap=await db.collection("checkins").where("shiftKey","==",cur.key).get();
+      const list=snap.docs.map(d=>d.data());
+      list.sort((a,b)=>((b.ts&&b.ts.seconds)||0)-((a.ts&&a.ts.seconds)||0));
+      const box=el("recent-list"); if(!box) return;
+      if(!list.length){ box.innerHTML='<div class="empty">ยังไม่มีคนเข้าเวรนี้</div>'; return; }
+      box.innerHTML=list.map(c=>`<div class="person-row">
+        <div class="avatar" style="background:var(--teal)">${(c.fullName||"?").charAt(0)}</div>
+        <div class="meta"><div class="n">${esc(c.fullName)}</div>
+          <div class="s">${c.ts&&c.ts.toDate?c.ts.toDate().toLocaleTimeString("th-TH",{hour:"2-digit",minute:"2-digit"}):""}</div></div>
+        <span class="badge badge-shift">✓</span></div>`).join("");
+    }catch(e){}
+  }
+
+  /* simple audio feedback */
+  function beep(ok){
+    try{
+      const ctx=new (window.AudioContext||window.webkitAudioContext)();
+      const o=ctx.createOscillator(), g=ctx.createGain();
+      o.connect(g); g.connect(ctx.destination);
+      o.frequency.value=ok?880:220; o.type="sine";
+      g.gain.setValueAtTime(0.2,ctx.currentTime);
+      o.start(); o.stop(ctx.currentTime+0.15);
+    }catch(e){}
+  }
+  </script>
+</body>
+</html>
